@@ -1,0 +1,42 @@
+const STEP_LABELS: Record<string, string> = {
+  queued: '待機中...',
+  info: '動画情報を取得中...',
+  downloading: '動画をダウンロード中...',
+  checking: 'アップロードされた動画を確認中...',
+  extracting_audio: '音声を抽出中...',
+  transcribing: '音声を認識中(字幕生成)...',
+  building_segments: '無音区間を解析中...',
+  review_ready: '解析完了',
+  rendering: '書き出し中...',
+  done: '完成しました',
+}
+
+export function stepLabel(step?: string | null): string {
+  if (!step) return '処理中...'
+  if (step.startsWith('rendering')) {
+    const match = step.match(/\((\d+)\/(\d+)\)/)
+    if (match) {
+      return `字幕焼き込み・書き出し中... (${match[1]}/${match[2]})`
+    }
+    return STEP_LABELS.rendering
+  }
+  return STEP_LABELS[step] ?? step
+}
+
+export function ProgressScreen({
+  step,
+  title,
+}: {
+  step?: string | null
+  title: string
+}) {
+  return (
+    <div className="flex flex-col items-center justify-center gap-6 py-20 text-center">
+      <div className="h-12 w-12 animate-spin rounded-full border-4 border-slate-700 border-t-purple-500" />
+      <div>
+        <h2 className="text-xl font-semibold text-slate-100">{title}</h2>
+        <p className="mt-2 text-slate-400">{stepLabel(step)}</p>
+      </div>
+    </div>
+  )
+}

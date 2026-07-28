@@ -1,0 +1,167 @@
+import { useRef, useState } from 'react'
+
+const ALLOWED_EXTENSIONS = ['.mp4', '.mov', '.mkv', '.webm', '.avi', '.m4v']
+const MAX_FILE_SIZE_MB = 500
+
+export function UrlInputScreen({
+  onSubmitUrl,
+  onSubmitFile,
+  errorMessage,
+}: {
+  onSubmitUrl: (url: string) => void
+  onSubmitFile: (file: File) => void
+  errorMessage?: string | null
+}) {
+  const [mode, setMode] = useState<'url' | 'file'>('url')
+  const [url, setUrl] = useState('')
+  const [selectedFile, setSelectedFile] = useState<File | null>(null)
+  const [fileError, setFileError] = useState<string | null>(null)
+  const fileInputRef = useRef<HTMLInputElement | null>(null)
+
+  const handleSubmit = (e: React.FormEvent) => {
+    e.preventDefault()
+    if (mode === 'url') {
+      if (!url.trim()) return
+      onSubmitUrl(url.trim())
+      return
+    }
+    if (!selectedFile) return
+    onSubmitFile(selectedFile)
+  }
+
+  const validateAndSetFile = (file: File | null) => {
+    setFileError(null)
+    if (!file) {
+      setSelectedFile(null)
+      return
+    }
+    const ext = file.name.slice(file.name.lastIndexOf('.')).toLowerCase()
+    if (!ALLOWED_EXTENSIONS.includes(ext)) {
+      setFileError(`対応していないファイル形式です(対応形式: ${ALLOWED_EXTENSIONS.join(', ')})`)
+      setSelectedFile(null)
+      return
+    }
+    if (file.size > MAX_FILE_SIZE_MB * 1024 * 1024) {
+      setFileError(`ファイルサイズが大きすぎます(上限 ${MAX_FILE_SIZE_MB}MB)`)
+      setSelectedFile(null)
+      return
+    }
+    setSelectedFile(file)
+  }
+
+  const handleDrop = (e: React.DragEvent<HTMLDivElement>) => {
+    e.preventDefault()
+    const file = e.dataTransfer.files?.[0] ?? null
+    validateAndSetFile(file)
+  }
+
+  return (
+    <div className="mx-auto flex max-w-2xl flex-col items-center gap-8 py-16 text-center">
+      <div>
+        <h1 className="text-3xl font-bold text-slate-100 sm:text-4xl">
+          URLや動画ファイルから。
+          <br />
+          切り抜き動画を自動作成。
+        </h1>
+        <p className="mt-4 text-slate-400">
+          動画URLの入力、またはお手元の動画ファイルのアップロードで、
+          字幕生成・無音カット・字幕焼き込みまで自動で処理します。
+          <br />
+          仕上がりはダウンロード前にプレビューで確認・修正できます。
+        </p>
+      </div>
+
+      <div className="flex w-full rounded-lg border border-slate-700 bg-slate-900 p-1">
+        <button
+          type="button"
+          onClick={() => setMode('url')}
+          className={`flex-1 rounded-md px-4 py-2 text-sm font-semibold transition ${
+            mode === 'url' ? 'bg-purple-600 text-white' : 'text-slate-400 hover:text-slate-200'
+          }`}
+        >
+          URLを入力
+        </button>
+        <button
+          type="button"
+          onClick={() => setMode('file')}
+          className={`flex-1 rounded-md px-4 py-2 text-sm font-semibold transition ${
+            mode === 'file' ? 'bg-purple-600 text-white' : 'text-slate-400 hover:text-slate-200'
+          }`}
+        >
+          動画ファイルをアップロード
+        </button>
+      </div>
+
+      <form onSubmit={handleSubmit} className="flex w-full flex-col gap-3">
+        {mode === 'url' ? (
+          <div className="flex w-full flex-col gap-3 sm:flex-row">
+            <input
+              type="text"
+              value={url}
+              onChange={(e) => setUrl(e.target.value)}
+              placeholder="https://www.youtube.com/watch?v=..."
+              className="w-full flex-1 rounded-lg border border-slate-700 bg-slate-900 px-4 py-3 text-slate-100 placeholder-slate-500 outline-none focus:border-purple-500"
+            />
+            <button
+              type="submit"
+              className="rounded-lg bg-purple-600 px-6 py-3 font-semibold text-white transition hover:bg-purple-500"
+            >
+              作成開始
+            </button>
+          </div>
+        ) : (
+          <div className="flex w-full flex-col gap-3">
+            <div
+              onClick={() => fileInputRef.current?.click()}
+              onDragOver={(e) => e.preventDefault()}
+              onDrop={handleDrop}
+              className="flex w-full cursor-pointer flex-col items-center gap-2 rounded-lg border-2 border-dashed border-slate-700 bg-slate-900 px-4 py-8 text-slate-400 transition hover:border-purple-500"
+            >
+              <input
+                ref={fileInputRef}
+                type="file"
+                accept={ALLOWED_EXTENSIONS.join(',')}
+                className="hidden"
+                onChange={(e) => validateAndSetFile(e.target.files?.[0] ?? null)}
+              />
+              {selectedFile ? (
+                <span className="text-slate-100">{selectedFile.name}</span>
+              ) : (
+                <>
+                  <span>クリックまたはドラッグ＆ドロップで動画ファイルを選択</span>
+                  <span className="text-xs text-slate-500">
+                    対応形式: {ALLOWED_EXTENSIONS.join(', ')} / 上限 {MAX_FILE_SIZE_MB}MB
+                  </span>
+                </>
+              )}
+            </div>
+            {fileError && (
+              <div className="w-full rounded-lg border border-red-800 bg-red-950/50 px-4 py-3 text-left text-sm text-red-300">
+                {fileError}
+              </div>
+            )}
+            <button
+              type="submit"
+              disabled={!selectedFile}
+              className="rounded-lg bg-purple-600 px-6 py-3 font-semibold text-white transition hover:bg-purple-500 disabled:cursor-not-allowed disabled:opacity-50"
+            >
+              作成開始
+            </button>
+          </div>
+        )}
+      </form>
+
+      {errorMessage && (
+        <div className="w-full rounded-lg border border-red-800 bg-red-950/50 px-4 py-3 text-left text-sm text-red-300">
+          {errorMessage}
+        </div>
+      )}
+
+      <div className="w-full rounded-lg border border-slate-800 bg-slate-900/50 px-4 py-3 text-left text-xs text-slate-500">
+        ご注意: 入力・アップロードする動画コンテンツの著作権・利用権は必ずご自身でご確認ください。
+        他者の権利を侵害する形での利用は禁止されています(YouTube等の外部サービスの利用規約が適用される場合があります)。
+        処理には数分程度かかる場合があります。
+      </div>
+    </div>
+  )
+}
