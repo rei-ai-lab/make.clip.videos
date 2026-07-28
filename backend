@@ -1,0 +1,423 @@
+
+import os
+
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+PROJECT_ROOT = os.path.dirname(BASE_DIR)
+
+STORAGE_DIR = os.path.join(PROJECT_ROOT, "storage")
+DOWNLOADS_DIR = os.path.join(STORAGE_DIR, "downloads")
+OUTPUTS_DIR = os.path.join(STORAGE_DIR, "outputs")
+WORK_DIR = os.path.join(STORAGE_DIR, "work")
+
+for d in (DOWNLOADS_DIR, OUTPUTS_DIR, WORK_DIR):
+    os.makedirs(d, exist_ok=True)
+
+FFMPEG_BIN = os.environ.get("FFMPEG_BIN", "/workspace/tools/bin/ffmpeg")
+FFPROBE_BIN = os.environ.get("FFPROBE_BIN", "/workspace/tools/bin/ffprobe")
+
+# MVP limits
+MAX_DURATION_SEC = int(os.environ.get("MAX_DURATION_SEC", 60 * 10))  # 10 min
+DOWNLOAD_MAX_HEIGHT = 720
+
+# Local file upload limits
+ALLOWED_UPLOAD_EXTENSIONS = {".mp4", ".mov", ".mkv", ".webm", ".avi", ".m4v"}
+MAX_UPLOAD_BYTES = int(os.environ.get("MAX_UPLOAD_BYTES", 500 * 1024 * 1024))  # 500MB
+
+# Whisper
+WHISPER_MODEL_SIZE = os.environ.get("WHISPER_MODEL_SIZE", "small")
+WHISPER_DEVICE = os.environ.get("WHISPER_DEVICE", "cpu")
+WHISPER_COMPUTE_TYPE = os.environ.get("WHISPER_COMPUTE_TYPE", "int8")
+
+# Segment merge tuning
+MERGE_GAP_SEC = 0.3
+PAD_SEC = 0.15
+
+# Output cleanup (hours) - not actively scheduled in MVP, informational constant
+OUTPUT_RETENTION_HOURS = 6
+
+from __future__ import annotations
+
+import asyncio
+import os
+import shutil
+import time
+import uuid
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional
+
+from . import config, pipeline
+from .models import Segment
+
+
+@dataclass
+class Job:
+    job_id: str
+    source_url: str
+    status: str = "queued"
+    step: Optional[str] = None
+    error: Optional[str] = None
+    progress: Optional[float] = None
+    duration: Optional[float] = None
+    segments: Optional[List[Segment]] = None
+    source_path: Optional[str] = None
+    source_media_url: Optional[str] = None
+    output_path: Optional[str] = None
+    output_url: Optional[str] = None
+    created_at: float = field(default_factory=time.time)
+
+    @property
+    def job_dir(self) -> str:
+        d = os.path.join(config.WORK_DIR, self.job_id)
+        os.makedirs(d, exist_ok=True)
+        return d
+
+
+class JobManager:
+    def __init__(self) -> None:
+        self.jobs: Dict[str, Job] = {}
+        self._queue: "asyncio.Queue[tuple[str, str]]" = asyncio.Queue()
+        self._worker_task: Optional[asyncio.Task] = None
+
+    def start(self) -> None:
+        if self._worker_task is None:
+            self._worker_task = asyncio.create_task(self._worker_loop())
+
+    def get(self, job_id: str) -> Optional[Job]:
+        return self.jobs.get(job_id)
+
+    def create_analyze_job(self, url: str) -> Job:
+        job_id = uuid.uuid4().hex[:12]
+        job = Job(job_id=job_id, source_url=url, status="queued", step="queued")
+        self.jobs[job_id] = job
+        self._queue.put_nowait((job_id, "analyze"))
+        return job
+
+    def create_upload_job(self, job_id: str, source_path: str, filename: str) -> Job:
+        job = Job(
+            job_id=job_id,
+            source_url=filename,
+            status="queued",
+            step="queued",
+            source_path=source_path,
+        )
+        self.jobs[job_id] = job
+        self._queue.put_nowait((job_id, "analyze_upload"))
+        return job
+
+    def enqueue_render(self, job_id: str, segments: List[Segment]) -> Job:
+        job = self.jobs[job_id]
+        job.segments = segments
+        job.status = "queued"
+        job.step = "queued"
+        job.error = None
+        self._queue.put_nowait((job_id, "render"))
+        return job
+
+    async def _worker_loop(self) -> None:
+        while True:
+            job_id, kind = await self._queue.get()
+            job = self.jobs.get(job_id)
+            if job is None:
+                self._queue.task_done()
+                continue
+            try:
+                if kind == "analyze":
+                    await self._do_analyze(job)
+                elif kind == "analyze_upload":
+                    await self._do_analyze_upload(job)
+                elif kind == "render":
+                    await self._do_render(job)
+            except Exception as exc:  # noqa: BLE001
+                job.status = "failed"
+                job.error = str(exc)
+            finally:
+                self._queue.task_done()
+
+    async def _do_analyze(self, job: Job) -> None:
+        loop = asyncio.get_running_loop()
+        job.status = "processing"
+        job.step = "info"
+        try:
+            info = await loop.run_in_executor(None, pipeline.fetch_info, job.source_url)
+            duration = info.get("duration")
+            if duration and duration > config.MAX_DURATION_SEC:
+                raise pipeline.PipelineError(
+                    f"動画が長すぎます(上限 {config.MAX_DURATION_SEC // 60}分)"
+                )
+
+            job.step = "downloading"
+            video_path = await loop.run_in_executor(
+                None, pipeline.download_video, job.source_url, job.job_dir
+            )
+
+            actual_duration = await loop.run_in_executor(None, pipeline.probe_duration, video_path)
+            if actual_duration > config.MAX_DURATION_SEC:
+                raise pipeline.PipelineError(
+                    f"動画が長すぎます(上限 {config.MAX_DURATION_SEC // 60}分)"
+                )
+
+            job.step = "extracting_audio"
+            audio_path = await loop.run_in_executor(
+                None, pipeline.extract_audio, video_path, job.job_dir
+            )
+
+            job.step = "transcribing"
+            raw = await loop.run_in_executor(None, pipeline.transcribe, audio_path)
+
+            job.step = "building_segments"
+            segments = pipeline.build_segments(raw, actual_duration)
+            if not segments:
+                raise pipeline.PipelineError("音声が検出できませんでした")
+
+            job.duration = actual_duration
+            job.segments = segments
+            job.source_path = video_path
+            job.source_media_url = f"/media/{job.job_id}/source.mp4"
+            job.status = "review_ready"
+            job.step = "review_ready"
+        except pipeline.PipelineError as exc:
+            job.status = "failed"
+            job.error = str(exc)
+        except Exception as exc:  # noqa: BLE001
+            job.status = "failed"
+            job.error = f"予期しないエラー: {exc}"
+
+    async def _do_analyze_upload(self, job: Job) -> None:
+        loop = asyncio.get_running_loop()
+        job.status = "processing"
+        job.step = "checking"
+        try:
+            video_path = job.source_path
+            if not video_path or not os.path.exists(video_path):
+                raise pipeline.PipelineError("アップロードされたファイルが見つかりません")
+
+            actual_duration = await loop.run_in_executor(None, pipeline.probe_duration, video_path)
+            if actual_duration > config.MAX_DURATION_SEC:
+                raise pipeline.PipelineError(
+                    f"動画が長すぎます(上限 {config.MAX_DURATION_SEC // 60}分)"
+                )
+
+            job.step = "extracting_audio"
+            audio_path = await loop.run_in_executor(
+                None, pipeline.extract_audio, video_path, job.job_dir
+            )
+
+            job.step = "transcribing"
+            raw = await loop.run_in_executor(None, pipeline.transcribe, audio_path)
+
+            job.step = "building_segments"
+            segments = pipeline.build_segments(raw, actual_duration)
+            if not segments:
+                raise pipeline.PipelineError("音声が検出できませんでした")
+
+            job.duration = actual_duration
+            job.segments = segments
+            job.source_media_url = f"/media/{job.job_id}/source.mp4"
+            job.status = "review_ready"
+            job.step = "review_ready"
+        except pipeline.PipelineError as exc:
+            job.status = "failed"
+            job.error = str(exc)
+        except Exception as exc:  # noqa: BLE001
+            job.status = "failed"
+            job.error = f"予期しないエラー: {exc}"
+
+    async def _do_render(self, job: Job) -> None:
+        loop = asyncio.get_running_loop()
+        job.status = "processing"
+        job.step = "rendering"
+        try:
+            if not job.source_path or not job.segments:
+                raise pipeline.PipelineError("解析データがありません")
+
+            output_path = os.path.join(config.OUTPUTS_DIR, f"{job.job_id}.mp4")
+
+            def _progress(done: int, total: int) -> None:
+                job.progress = done / total if total else None
+                job.step = f"rendering ({done}/{total})"
+
+            await loop.run_in_executor(
+                None,
+                pipeline.render_segments,
+                job.source_path,
+                job.segments,
+                job.job_dir,
+                output_path,
+                _progress,
+            )
+
+            job.output_path = output_path
+            job.output_url = f"/outputs/{job.job_id}.mp4"
+            job.status = "done"
+            job.step = "done"
+
+            shutil.rmtree(job.job_dir, ignore_errors=True)
+        except pipeline.PipelineError as exc:
+            job.status = "failed"
+            job.error = str(exc)
+        except Exception as exc:  # noqa: BLE001
+            job.status = "failed"
+            job.error = f"予期しないエラー: {exc}"
+
+
+job_manager = JobManager()
+
+from __future__ import annotations
+
+import os
+import shutil
+import uuid
+
+from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+from starlette.concurrency import run_in_threadpool
+
+from . import config, pipeline
+from .job_manager import job_manager
+from .models import CreateJobRequest, JobStatusResponse, RenderRequest
+
+app = FastAPI(title="Kirinuki Auto Editor")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+app.mount("/media", StaticFiles(directory=config.WORK_DIR), name="media")
+app.mount("/outputs", StaticFiles(directory=config.OUTPUTS_DIR), name="outputs")
+
+
+@app.on_event("startup")
+async def _startup() -> None:
+    job_manager.start()
+
+
+def _to_response(job) -> JobStatusResponse:
+    return JobStatusResponse(
+        job_id=job.job_id,
+        status=job.status,
+        step=job.step,
+        error=job.error,
+        progress=job.progress,
+        source_url=job.source_url,
+        source_media_url=job.source_media_url,
+        duration=job.duration,
+        segments=job.segments,
+        output_url=job.output_url,
+    )
+
+
+@app.post("/api/jobs", response_model=JobStatusResponse)
+async def create_job(req: CreateJobRequest) -> JobStatusResponse:
+    if not req.url or not req.url.strip().lower().startswith(("http://", "https://")):
+        raise HTTPException(status_code=400, detail="有効なURLを入力してください")
+    job = job_manager.create_analyze_job(req.url.strip())
+    return _to_response(job)
+
+
+@app.post("/api/jobs/upload", response_model=JobStatusResponse)
+async def upload_job(file: UploadFile = File(...)) -> JobStatusResponse:
+    ext = os.path.splitext(file.filename or "")[1].lower()
+    if ext not in config.ALLOWED_UPLOAD_EXTENSIONS:
+        allowed = ", ".join(sorted(config.ALLOWED_UPLOAD_EXTENSIONS))
+        raise HTTPException(
+            status_code=400,
+            detail=f"対応していないファイル形式です(対応形式: {allowed})",
+        )
+
+    job_id = uuid.uuid4().hex[:12]
+    job_dir = os.path.join(config.WORK_DIR, job_id)
+    os.makedirs(job_dir, exist_ok=True)
+    tmp_path = os.path.join(job_dir, f"upload{ext}")
+
+    size = 0
+    try:
+        with open(tmp_path, "wb") as f:
+            while True:
+                chunk = await file.read(1024 * 1024)
+                if not chunk:
+                    break
+                size += len(chunk)
+                if size > config.MAX_UPLOAD_BYTES:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"ファイルサイズが大きすぎます(上限 {config.MAX_UPLOAD_BYTES // (1024 * 1024)}MB)",
+                    )
+                f.write(chunk)
+    except HTTPException:
+        shutil.rmtree(job_dir, ignore_errors=True)
+        raise
+    finally:
+        await file.close()
+
+    try:
+        video_path = await run_in_threadpool(pipeline.prepare_uploaded_video, tmp_path, job_dir)
+    except pipeline.PipelineError as exc:
+        shutil.rmtree(job_dir, ignore_errors=True)
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    job = job_manager.create_upload_job(job_id, video_path, file.filename or "アップロード動画")
+    return _to_response(job)
+
+
+@app.get("/api/jobs/{job_id}", response_model=JobStatusResponse)
+async def get_job(job_id: str) -> JobStatusResponse:
+    job = job_manager.get(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="ジョブが見つかりません")
+    return _to_response(job)
+
+
+@app.post("/api/jobs/{job_id}/render", response_model=JobStatusResponse)
+async def render_job(job_id: str, req: RenderRequest) -> JobStatusResponse:
+    job = job_manager.get(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="ジョブが見つかりません")
+    if job.status != "review_ready":
+        raise HTTPException(status_code=400, detail="現在このジョブは書き出しできる状態ではありません")
+    if not req.segments:
+        raise HTTPException(status_code=400, detail="区間が指定されていません")
+    job = job_manager.enqueue_render(job_id, req.segments)
+    return _to_response(job)
+
+
+@app.get("/api/health")
+async def health() -> dict:
+    return {"ok": True}
+
+from __future__ import annotations
+
+from typing import List, Optional
+from pydantic import BaseModel
+
+
+class Segment(BaseModel):
+    id: int
+    start: float
+    end: float
+    text: str
+    include: bool = True
+
+
+class CreateJobRequest(BaseModel):
+    url: str
+
+
+class RenderRequest(BaseModel):
+    segments: List[Segment]
+
+
+class JobStatusResponse(BaseModel):
+    job_id: str
+    status: str
+    step: Optional[str] = None
+    error: Optional[str] = None
+    progress: Optional[float] = None
+    source_url: Optional[str] = None
+    source_media_url: Optional[str] = None
+    duration: Optional[float] = None
+    segments: Optional[List[Segment]] = None
+    output_url: Optional[str] = None
